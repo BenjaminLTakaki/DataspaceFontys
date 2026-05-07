@@ -12,6 +12,7 @@
 # Usage:
 #   ./prepare-native-k3s-server.sh --repo /path/to/repo
 #   ./prepare-native-k3s-server.sh --repo /path --ip 172.20.10.15 --yes
+#   ./prepare-native-k3s-server.sh --repo /path --scenario gaia-x --reset-scenario --yes
 #
 set -euo pipefail
 
@@ -25,6 +26,9 @@ SKIP_K3S_INSTALL=0
 DO_CLONE=0
 SKIP_HEADLAMP=0
 DEPLOY_URL_PORTAL=1
+RESET_SCENARIO=0
+SCENARIO="local"
+MAVEN_PROFILES="local"
 PORTAL_REPO_URL="https://github.com/MarkKlerkx/DataspaceFontys.git"
 PORTAL_DIR="$HOME/DataspaceFontys"
 PORTAL_KUSTOMIZE_PATH="localDeployment/ingress-url-portal"
@@ -49,6 +53,9 @@ Options:
   --repo <path>       Repository root (default: current directory)
   --clone             Clone FIWARE/data-space-connector into --repo (or ./data-space-connector)
   --ip <address>      Internal server IP to materialize
+  --scenario <name>   Deployment scenario: local, central, gaia-x, elsi, dsp
+  --profiles <list>   Raw Maven profiles, e.g. local,central (overrides --scenario)
+  --reset-scenario    Delete DSC app namespaces before deploying, useful when switching scenarios
   --yes               Skip confirmation prompt
   --include-docs      Also update doc/**/*.md and doc/**/*.drawio
   --skip-k3s-install  Do not install/start k3s automatically
@@ -65,6 +72,31 @@ need_cmd() {
     echo "error: missing required command '$1'" >&2
     exit 1
   fi
+}
+
+set_scenario_profiles() {
+  case "$SCENARIO" in
+    local)
+      MAVEN_PROFILES="local"
+      ;;
+    central)
+      MAVEN_PROFILES="local,central"
+      ;;
+    gaia-x|gaiax)
+      SCENARIO="gaia-x"
+      MAVEN_PROFILES="local,gaia-x"
+      ;;
+    elsi)
+      MAVEN_PROFILES="local,elsi"
+      ;;
+    dsp)
+      MAVEN_PROFILES="local,dsp"
+      ;;
+    *)
+      echo "error: unknown scenario '$SCENARIO'. Use one of: local, central, gaia-x, elsi, dsp." >&2
+      exit 1
+      ;;
+  esac
 }
 
 detect_ipv4() {
@@ -181,6 +213,8 @@ print_findings() {
   echo "=== Native k3s migration report ==="
   echo "Repo                : $REPO_ROOT"
   echo "POM                 : $POM_FILE"
+  echo "Scenario            : $SCENARIO"
+  echo "Maven profiles      : $MAVEN_PROFILES"
   echo "Detected INTERNAL_IP: $TARGET_IP"
   echo "Candidate files     : ${#CANDIDATE_FILES[@]}"
   echo "Files with 127...   : ${#NIP_FILES[@]}"
@@ -203,7 +237,12 @@ print_findings() {
     echo "   - install via: curl -sfL https://get.k3s.io | sh -   (when missing)"
     echo "   - ensure kubeconfig at \$HOME/.kube/config for current user"
   fi
-  echo "5) Run: mvn -f \"$POM_FILE\" clean deploy -Plocal -Dhelm.version=3.20.2   (logs go to build.log)"
+  if [[ "$RESET_SCENARIO" -eq 1 ]]; then
+    echo "4b) Delete DSC app namespaces before deploying: provider consumer trust-anchor wallet infra"
+  else
+    echo "4b) Keep existing DSC namespaces (use --reset-scenario when switching variants)"
+  fi
+  echo "5) Run: mvn -f \"$POM_FILE\" clean deploy -P${MAVEN_PROFILES} -Dhelm.version=3.20.2   (logs go to build.log)"
   if [[ "$SKIP_APPLY" -eq 1 ]]; then
     echo "6) Skip kubectl apply (--skip-apply set)"
   else
@@ -460,7 +499,35 @@ build_manifests() {
     return 0
   fi
   need_cmd mvn
-  mvn -f "$POM_FILE" clean deploy -Plocal -Dhelm.version=3.20.2
+  mvn -f "$POM_FILE" clean deploy "-P${MAVEN_PROFILES}" -Dhelm.version=3.20.2
+}
+
+reset_scenario_namespaces() {
+  if [[ "$RESET_SCENARIO" -ne 1 ]]; then
+    return 0
+  fi
+  need_cmd kubectl
+  if [[ -z "${KUBECONFIG:-}" && -f "$HOME/.kube/config" ]]; then
+    export KUBECONFIG="$HOME/.kube/config"
+  fi
+  if [[ -z "${KUBECONFIG:-}" ]]; then
+    echo "error: KUBECONFIG is not set; cannot reset scenario namespaces." >&2
+    exit 1
+  fi
+
+  echo
+  echo "=== Resetting DSC scenario namespaces ==="
+  local ns=""
+  for ns in provider consumer trust-anchor wallet infra; do
+    kubectl --kubeconfig="$KUBECONFIG" delete namespace "$ns" --ignore-not-found --wait=false
+  done
+  for ns in provider consumer trust-anchor wallet infra; do
+    while kubectl --kubeconfig="$KUBECONFIG" get namespace "$ns" >/dev/null 2>&1; do
+      echo "Waiting for namespace $ns to terminate..."
+      sleep 5
+    done
+  done
+  echo "Scenario namespaces are clear."
 }
 
 apply_manifests() {
@@ -675,6 +742,18 @@ while [[ $# -gt 0 ]]; do
       IP_ARG="$2"
       shift 2
       ;;
+    --scenario)
+      [[ $# -gt 1 ]] || { echo "error: --scenario requires a value" >&2; exit 1; }
+      SCENARIO="$2"
+      shift 2
+      ;;
+    --profiles)
+      [[ $# -gt 1 ]] || { echo "error: --profiles requires a value" >&2; exit 1; }
+      MAVEN_PROFILES="$2"
+      SCENARIO="custom"
+      shift 2
+      ;;
+    --reset-scenario) RESET_SCENARIO=1; shift ;;
     --yes) FORCE_YES=1; shift ;;
     --include-docs) INCLUDE_DOCS=1; shift ;;
     --skip-k3s-install) SKIP_K3S_INSTALL=1; shift ;;
@@ -700,6 +779,9 @@ if [[ "$DO_CLONE" -eq 1 ]]; then
   clone_repo_if_requested
 fi
 
+if [[ "$SCENARIO" != "custom" ]]; then
+  set_scenario_profiles
+fi
 discover_repo
 setup_logging
 discover_pom
@@ -716,6 +798,7 @@ rewrite_hosts
 rewrite_demo_domains
 ensure_k3s_and_kubeconfig
 install_headlamp
+reset_scenario_namespaces
 build_manifests
 apply_manifests
 fix_marketplace_did_ingress_conflict
@@ -725,6 +808,7 @@ deploy_url_portal
 echo
 echo "Done."
 echo "Native k3s migration/deploy actions completed for: $REPO_ROOT"
+echo "Scenario: $SCENARIO (-P${MAVEN_PROFILES})"
 if [[ -n "${HEADLAMP_URL:-}" ]]; then
   echo
   echo "========================================="
