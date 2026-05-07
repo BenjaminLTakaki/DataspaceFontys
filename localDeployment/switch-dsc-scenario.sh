@@ -34,7 +34,7 @@ fi
 SCENARIO="$1"
 shift
 
-exec "$SCRIPT_DIR/prepare-native-k3s-server.sh" \
+exec bash "$SCRIPT_DIR/prepare-native-k3s-server.sh" \
   --scenario "$SCENARIO" \
   --reset-scenario \
   "$@"
